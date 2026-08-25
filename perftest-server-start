@@ -1,0 +1,192 @@
+#!/bin/bash
+# -*- mode: sh; indent-tabs-mode: nil; sh-basic-offset: 4 -*-
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=bash
+
+exec >perftest-server-stderrout.txt
+exec 2>&1
+
+. /usr/bin/perftest-base || (echo "/usr/bin/perftest-base not found"; exit 1)
+
+dump_runtime
+validate_label
+
+# defaults
+verb="write"
+device="none"
+ifname="none"
+duration=5
+report_interval=1
+size=65536
+qp=1
+bidirectional="false"
+connection="RC"
+gid_index="auto"
+cpu_pin="none"
+cpu_pin_list="none"
+rdma_cm="false"
+ib_port=1
+
+longopts="verb:,device:,ifname:,duration:,report-interval:,size:,qp:,bidirectional:,connection:,gid-index:,cpu-pin:,cpu-pin-list:,rdma-cm:"
+opts=$(getopt -q -o "" --longoptions "$longopts" -n "getopt.sh" -- "$@")
+if [ $? -ne 0 ]; then
+    exit_error "Unrecognized option specified"
+fi
+eval set -- "$opts"
+while true; do
+    case "$1" in
+        --verb)
+            shift
+            verb=$1
+            echo "verb=${verb}"
+            shift
+            ;;
+        --device)
+            shift
+            device=$1
+            echo "device=${device}"
+            shift
+            ;;
+        --ifname)
+            shift
+            ifname=$1
+            echo "ifname=${ifname}"
+            shift
+            ;;
+        --duration)
+            shift
+            duration=$1
+            echo "duration=${duration}"
+            shift
+            ;;
+        --report-interval)
+            shift
+            report_interval=$1
+            echo "report_interval=${report_interval}"
+            shift
+            ;;
+        --size)
+            shift
+            size=$1
+            echo "size=${size}"
+            shift
+            ;;
+        --qp)
+            shift
+            qp=$1
+            echo "qp=${qp}"
+            shift
+            ;;
+        --bidirectional)
+            shift
+            bidirectional=$1
+            echo "bidirectional=${bidirectional}"
+            shift
+            ;;
+        --connection)
+            shift
+            connection=$1
+            echo "connection=${connection}"
+            shift
+            ;;
+        --gid-index)
+            shift
+            gid_index=$1
+            echo "gid_index=${gid_index}"
+            shift
+            ;;
+        --cpu-pin)
+            shift
+            cpu_pin=$1
+            echo "cpu_pin=${cpu_pin}"
+            shift
+            ;;
+        --cpu-pin-list)
+            shift
+            cpu_pin_list=$1
+            echo "cpu_pin_list=${cpu_pin_list}"
+            shift
+            ;;
+        --rdma-cm)
+            shift
+            rdma_cm=$1
+            echo "rdma_cm=${rdma_cm}"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            exit_error "Invalid option: $1"
+            ;;
+    esac
+done
+
+case "${verb}" in
+    write|read|send)
+        ;;
+    *)
+        exit_error "unsupported verb '${verb}'"
+        ;;
+esac
+binary="ib_${verb}_bw"
+validate_sw_prereqs jq ip getopt stdbuf "${binary}"
+
+resolve_perftest_device
+resolve_ip_for_netdev "${netdev}"
+resolve_numa_node_for_netdev "${netdev}"
+resolve_gid_index
+resolve_cpu_pin_opts
+
+# perftest's control channel is a single TCP port used only to
+# negotiate QP setup before the RDMA data path runs (see -p in the
+# perftest man page) -- one port is enough, unlike iperf3 which needs
+# a separate control and data port.
+let "port = 30000 + $id"
+
+# A benchmark server can provide both an IP and ports to the client.
+# The server must package these in a JSON, which will be sent to
+# the endpoint. The endpoint may make adjustments to the IP and
+# ports depending on the network and security model.
+echo '{"svc":{"ip":"'$ip'","ports":['$port']}}' >msgs/tx/svc
+
+cmd="${binary} -d ${device} -i ${ib_port} -p ${port} -D ${report_interval} --run_infinitely -s ${size} -q ${qp} -c ${connection} --report_gbits"
+if [ "${bidirectional}" == "true" ]; then
+    cmd+=" -b"
+fi
+if [ -n "${gid_index}" ]; then
+    cmd+=" -x ${gid_index}"
+fi
+if [ "${rdma_cm}" == "true" ]; then
+    cmd+=" -R"
+fi
+if [ -n "${cpu_pin_cmd}" ]; then
+    cmd="${cpu_pin_cmd} ${cmd}"
+fi
+
+uname -a
+echo "going to run: ${cmd}"
+
+# --run_infinitely makes both sides of perftest run forever, printing
+# a fresh BW/msgrate report every report-interval seconds -- the
+# server no longer exits on its own once the client finishes (see
+# perftest-client for why `stdbuf --output=L` is required so those
+# periodic reports actually reach the result file). Lifecycle is now
+# the standard crucible pattern: background it, record its PID, and
+# let perftest-server-stop kill it once roadblock synchronization
+# reaches the stop phase.
+date +%s.%N > perftest-start.txt
+stdbuf --output=L ${cmd} >perftest-server-result.txt 2>&1 &
+pid=$!
+echo ${pid} >perftest-server.pid
+
+sleep 2
+if [ ! -e /proc/${pid} ]; then
+    if grep -qi "error\|fail" perftest-server-result.txt; then
+        exit_error "Server failed to start: $(grep -i 'error\|fail' perftest-server-result.txt)"
+    fi
+fi
+
+echo ps:
+ps aux | grep "${binary}"
+exit 0

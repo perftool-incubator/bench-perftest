@@ -1,0 +1,51 @@
+{
+    "rickshaw-benchmark": {
+        "schema": {
+            "version": "2020.05.18"
+        }
+    },
+    "benchmark": "perftest",
+    "controller": {
+        "post-script": "%bench-dir%perftest-post-process.py"
+    },
+    "client": {
+        "files-from-controller": [
+            {
+                "src": "%bench-dir%/perftest-base",
+                "dest": "/usr/bin/"
+            },
+            {
+                "src": "%bench-dir%/perftest-get-runtime",
+                "dest": "/usr/bin/"
+            },
+            {
+                "src": "%bench-dir%/perftest-timestamp-lines",
+                "dest": "/usr/bin/"
+            },
+            {
+                "src": "%bench-dir%/perftest-client",
+                "dest": "/usr/bin/"
+            }
+        ],
+        "runtime": "perftest-get-runtime",
+        "start": "perftest-client"
+    },
+    "server": {
+        "files-from-controller": [
+            {
+                "src": "%bench-dir%/perftest-base",
+                "dest": "/usr/bin/"
+            },
+            {
+                "src": "%bench-dir%/perftest-server-start",
+                "dest": "/usr/bin/"
+            },
+            {
+                "src": "%bench-dir%/perftest-server-stop",
+                "dest": "/usr/bin/"
+            }
+        ],
+        "start": "perftest-server-start",
+        "stop": "perftest-server-stop"
+    }
+}

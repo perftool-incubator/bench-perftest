@@ -1,0 +1,256 @@
+#!/bin/bash
+# -*- mode: sh; indent-tabs-mode: nil; sh-basic-offset: 4 -*-
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=bash
+
+exec >perftest-client-stderrout.txt
+exec 2>&1
+
+. /usr/bin/perftest-base || (echo "/usr/bin/perftest-base not found"; exit 1)
+
+dump_runtime
+validate_label
+
+# defaults (must mirror perftest-server-start)
+verb="write"
+device="none"
+ifname="none"
+duration=5
+report_interval=1
+size=65536
+qp=1
+bidirectional="false"
+connection="RC"
+gid_index="auto"
+cpu_pin="none"
+cpu_pin_list="none"
+rdma_cm="false"
+ib_port=1
+
+longopts="verb:,device:,ifname:,duration:,report-interval:,size:,qp:,bidirectional:,connection:,gid-index:,cpu-pin:,cpu-pin-list:,rdma-cm:"
+opts=$(getopt -q -o "" --longoptions "$longopts" -n "getopt.sh" -- "$@")
+if [ $? -ne 0 ]; then
+    exit_error "Unrecognized option specified"
+fi
+eval set -- "$opts"
+while true; do
+    case "$1" in
+        --verb)
+            shift
+            verb=$1
+            echo "verb=${verb}"
+            shift
+            ;;
+        --device)
+            shift
+            device=$1
+            echo "device=${device}"
+            shift
+            ;;
+        --ifname)
+            shift
+            ifname=$1
+            echo "ifname=${ifname}"
+            shift
+            ;;
+        --duration)
+            shift
+            duration=$1
+            echo "duration=${duration}"
+            shift
+            ;;
+        --report-interval)
+            shift
+            report_interval=$1
+            echo "report_interval=${report_interval}"
+            shift
+            ;;
+        --size)
+            shift
+            size=$1
+            echo "size=${size}"
+            shift
+            ;;
+        --qp)
+            shift
+            qp=$1
+            echo "qp=${qp}"
+            shift
+            ;;
+        --bidirectional)
+            shift
+            bidirectional=$1
+            echo "bidirectional=${bidirectional}"
+            shift
+            ;;
+        --connection)
+            shift
+            connection=$1
+            echo "connection=${connection}"
+            shift
+            ;;
+        --gid-index)
+            shift
+            gid_index=$1
+            echo "gid_index=${gid_index}"
+            shift
+            ;;
+        --cpu-pin)
+            shift
+            cpu_pin=$1
+            echo "cpu_pin=${cpu_pin}"
+            shift
+            ;;
+        --cpu-pin-list)
+            shift
+            cpu_pin_list=$1
+            echo "cpu_pin_list=${cpu_pin_list}"
+            shift
+            ;;
+        --rdma-cm)
+            shift
+            rdma_cm=$1
+            echo "rdma_cm=${rdma_cm}"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            exit_error "Invalid option: $1"
+            ;;
+    esac
+done
+
+case "${verb}" in
+    write|read|send)
+        ;;
+    *)
+        exit_error "unsupported verb '${verb}'"
+        ;;
+esac
+binary="ib_${verb}_bw"
+validate_sw_prereqs jq getopt stdbuf "${binary}"
+
+remotehost=""
+port=""
+file="msgs/rx/svc"
+if [ -e "${file}" ]; then
+    remotehost=$(jq -r '.svc.ip' ${file})
+    port=$(jq -r '.svc.ports[0]' ${file})
+fi
+if [ -z "${remotehost}" ] || [ "${remotehost}" == "null" ]; then
+    exit_error "remotehost is not set (no msgs/rx/svc found)"
+fi
+if [ -z "${port}" ] || [ "${port}" == "null" ]; then
+    exit_error "control port is not set (no msgs/rx/svc found)"
+fi
+
+resolve_perftest_device
+resolve_numa_node_for_netdev "${netdev}"
+resolve_gid_index
+resolve_cpu_pin_opts
+
+cmd="${binary} -d ${device} -i ${ib_port} -p ${port} -D ${report_interval} --run_infinitely -s ${size} -q ${qp} -c ${connection} --report_gbits"
+if [ "${bidirectional}" == "true" ]; then
+    cmd+=" -b"
+fi
+if [ -n "${gid_index}" ]; then
+    cmd+=" -x ${gid_index}"
+fi
+if [ "${rdma_cm}" == "true" ]; then
+    cmd+=" -R"
+fi
+cmd+=" ${remotehost}"
+if [ -n "${cpu_pin_cmd}" ]; then
+    cmd="${cpu_pin_cmd} ${cmd}"
+fi
+
+# --run_infinitely makes perftest print a fresh BW/msgrate report
+# every -D/report-interval seconds forever -- it never stops on its
+# own. perftest registers no SIGTERM handler and its stdout is fully
+# buffered whenever it isn't a tty, so without `stdbuf --output=L`
+# forcing line-buffering, every periodic report since the last libc
+# flush would be lost the instant we kill it (verified against
+# upstream source: no setvbuf/signal(SIGTERM,...) calls anywhere in
+# perftest).
+full_cmd="stdbuf --output=L ${cmd}"
+
+# perftest-post-process.py derives every sample's timestamps from the
+# lines' own real arrival times -- report-interval is only needed as a
+# best-effort estimate of the first sample's "begin" (it has no
+# previous real timestamp to anchor to).
+echo "${report_interval}" > perftest-report-interval.txt
+
+uname -a
+echo "going to run: ${full_cmd}"
+
+# perftest's report lines carry no timestamp of their own, and its
+# internal print-thread sleep() can drift under CPU contention from
+# the main polling loop -- confirmed live: only 23 of an expected ~30
+# reports arrived in a clean, precisely-timed 30-second window at
+# report-interval=1. So report-interval can't be trusted to derive
+# accurate per-sample timestamps after the fact by assuming fixed
+# spacing. Instead, perftest's output is piped through
+# perftest-timestamp-lines, which stamps each line with its own real
+# arrival time as it's captured -- sample spacing then reflects
+# reality instead of an assumption, and how many samples actually
+# landed stops mattering. A FIFO (not a plain shell pipe) is used so
+# this script keeps perftest's own PID separate from the
+# timestamper's, letting `kill` target the actual perftest process
+# directly instead of the last stage of a pipeline.
+fifo=$(mktemp -u perftest-fifo.XXXXXX)
+mkfifo "${fifo}"
+: > perftest-client-result.txt
+perftest-timestamp-lines < "${fifo}" > perftest-client-result.txt &
+ts_pid=$!
+${full_cmd} > "${fifo}" 2>&1 &
+pid=$!
+
+# QP/GID negotiation over the TCP control channel happens before
+# perftest's periodic print thread starts counting report-interval --
+# that setup time is unpredictable (observed ~7-8s on real ConnectX-6
+# hardware) and isn't part of what the user asked `duration` to cover.
+# So instead of timing the whole process from launch (which would make
+# the actual measurement window shorter than `duration` by however
+# long setup took), wait for the first real periodic report line to
+# appear -- that's when measurement actually begins -- and only then
+# start the `duration`-second countdown.
+setup_deadline=$(($(date +%s) + 60))
+report_line_re='^[0-9]+\.[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+\.[0-9]+[[:space:]]+[0-9]+\.[0-9]+[[:space:]]+[0-9]+\.[0-9]+[[:space:]]*$'
+while ! grep -qE "${report_line_re}" perftest-client-result.txt; do
+    if ! kill -0 ${pid} 2>/dev/null; then
+        wait ${pid}
+        rc=$?
+        rm -f "${fifo}"
+        exit_error "perftest client exited before measurement began (rc=${rc}): $(cat perftest-client-result.txt)"
+    fi
+    if [ $(date +%s) -ge ${setup_deadline} ]; then
+        kill -9 ${pid} 2>/dev/null
+        rm -f "${fifo}"
+        exit_error "perftest client did not begin reporting within 60s: $(cat perftest-client-result.txt)"
+    fi
+    sleep 0.2
+done
+
+date +%s.%N > perftest-start.txt
+sleep ${duration}
+kill ${pid} 2>/dev/null
+grace=0
+while [ ${grace} -lt 20 ] && kill -0 ${pid} 2>/dev/null; do
+    sleep 0.1
+    grace=$((grace + 1))
+done
+if kill -0 ${pid} 2>/dev/null; then
+    kill -9 ${pid} 2>/dev/null
+fi
+wait ${pid}
+rc=$?
+wait ${ts_pid} 2>/dev/null
+rm -f "${fifo}"
+date +%s.%N > perftest-stop.txt
+
+if [ ${rc} -ne 0 ] && [ ${rc} -ne 143 ] && [ ${rc} -ne 137 ]; then
+    exit_error "perftest client failed (rc=${rc}): $(cat perftest-client-result.txt)"
+fi
+exit 0

@@ -1,0 +1,56 @@
+{
+    "presets": {
+        "defaults": [
+            { "arg": "verb", "vals": ["write"] },
+            { "arg": "duration", "vals": ["5"] },
+            { "arg": "report-interval", "vals": ["1"] },
+            { "arg": "size", "vals": ["65536"] },
+            { "arg": "qp", "vals": ["1"] },
+            { "arg": "bidirectional", "vals": ["false"] },
+            { "arg": "connection", "vals": ["RC"] },
+            { "arg": "gid-index", "vals": ["auto"] },
+            { "arg": "cpu-pin", "vals": ["none"] },
+            { "arg": "cpu-pin-list", "vals": ["none"] },
+            { "arg": "rdma-cm", "vals": ["false"] },
+            { "arg": "device", "vals": ["none"] },
+            { "arg": "ifname", "vals": ["none"] }
+        ]
+    },
+    "validations": {
+        "verbs": {
+            "description": "the perftest verb to run",
+            "args": [ "verb" ],
+            "vals": "^write$|^read$|^send$"
+        },
+        "positive_integer": {
+            "description": "a whole number greater than 0",
+            "args": [ "duration", "report-interval", "size", "qp" ],
+            "vals": "[1-9][0-9]*"
+        },
+        "boolean": {
+            "description": "true or false",
+            "args": [ "bidirectional", "rdma-cm" ],
+            "vals": "^true$|^false$"
+        },
+        "connection-types": {
+            "description": "RDMA connection type",
+            "args": [ "connection" ],
+            "vals": "^RC$|^UC$|^UD$|^SRD$"
+        },
+        "gid-index": {
+            "description": "auto, none, or an explicit GID index number",
+            "args": [ "gid-index" ],
+            "vals": "^auto$|^none$|^[0-9]+$"
+        },
+        "cpu-pin-modes": {
+            "description": "cpu pinning mode",
+            "args": [ "cpu-pin" ],
+            "vals": "^numa$|^cpu$|^none$"
+        },
+        "non-empty-string": {
+            "description": "any non-empty string",
+            "args": [ "device", "ifname", "cpu-pin-list" ],
+            "vals": "^.+$"
+        }
+    }
+}

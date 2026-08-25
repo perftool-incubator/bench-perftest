@@ -1,0 +1,27 @@
+{
+    "workshop": {
+        "schema": {
+            "version": "2020.03.02"
+        }
+    },
+    "userenvs": [
+        {
+            "name": "default",
+            "requirements": [
+                "perftest_pkgs"
+            ]
+        }
+    ],
+    "requirements": [
+        {
+            "name": "perftest_pkgs",
+            "type": "distro",
+            "distro_info": {
+                "packages": [
+                    "perftest",
+                    "rdma-core"
+                ]
+            }
+        }
+    ]
+}

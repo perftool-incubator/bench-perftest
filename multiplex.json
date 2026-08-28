@@ -25,7 +25,7 @@
         "positive_integer": {
             "description": "a whole number greater than 0",
             "args": [ "duration", "report-interval", "size", "qp" ],
-            "vals": "[1-9][0-9]*"
+            "vals": "^[1-9][0-9]*$"
         },
         "boolean": {
             "description": "true or false",

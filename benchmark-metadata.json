@@ -19,6 +19,13 @@
     ],
     "output_files": [
         "perftest-client-result.txt",
-        "perftest-server-result.txt"
+        "perftest-server-result.txt",
+        "perftest-report-interval.txt",
+        "perftest-client-stderrout.txt",
+        "perftest-server-stderrout.txt",
+        "perftest-server-stop-stderrout.txt",
+        "perftest-start.txt",
+        "perftest-stop.txt",
+        "perftest-server.pid"
     ]
 }

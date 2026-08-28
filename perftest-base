@@ -1,0 +1,184 @@
+#!/bin/bash
+# -*- mode: sh; indent-tabs-mode: nil; sh-basic-offset: 4 -*-
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=bash
+
+if ! source ${TOOLBOX_HOME}/bash/library/bench-base; then
+    echo "ERROR: Could not source bench-base from \$TOOLBOX_HOME [${TOOLBOX_HOME}]"
+    exit 1
+fi
+
+# Resolves the RDMA device name and its associated netdev from the
+# --device/--ifname params. Exactly one of $device/$ifname must be set
+# to something other than "none" before calling this.
+# Uses: $device, $ifname
+# Sets: $device, $netdev
+function resolve_perftest_device() {
+    netdev=""
+    if [ "${device}" != "none" ] && [ -n "${device}" ]; then
+        if [ ! -d "/sys/class/infiniband/${device}" ]; then
+            exit_error "RDMA device '${device}' not found under /sys/class/infiniband"
+        fi
+        for netdev_path in /sys/class/infiniband/${device}/device/net/*; do
+            if [ -d "${netdev_path}" ]; then
+                netdev=$(basename "${netdev_path}")
+                break
+            fi
+        done
+        if [ -z "${netdev}" ]; then
+            exit_error "could not find a netdev associated with RDMA device '${device}'"
+        fi
+    elif [ "${ifname}" != "none" ] && [ -n "${ifname}" ]; then
+        netdev="${ifname}"
+        device=""
+        for ib_dev_path in /sys/class/infiniband/*/; do
+            if [ -d "${ib_dev_path}device/net/${netdev}" ]; then
+                device=$(basename "${ib_dev_path%/}")
+                break
+            fi
+        done
+        if [ -z "${device}" ]; then
+            exit_error "could not find an RDMA device for netdev '${netdev}'"
+        fi
+    else
+        exit_error "one of --device or --ifname must be specified"
+    fi
+}
+
+# Resolves the NUMA node (and its CPU list) for a given netdev, walking
+# stacked/VLAN "lower_*" interfaces down to a physical device -- same
+# approach bench-iperf uses for its cpu-pin support.
+# Sets: $numa_node, $numa_node_cpus
+function resolve_numa_node_for_netdev() {
+    local netdev_lookup="$1"
+    numa_node=
+    numa_node_cpus=
+    while [ ! -e /sys/class/net/${netdev_lookup}/device/numa_node ]; do
+        local found_lower=""
+        for lower_path in /sys/class/net/${netdev_lookup}/lower_*; do
+            if [ -e "${lower_path}" ]; then
+                netdev_lookup=${lower_path##*/lower_}
+                found_lower=1
+                break
+            fi
+        done
+        if [ -z "${found_lower}" ]; then
+            break
+        fi
+    done
+    if [ -e /sys/class/net/${netdev_lookup}/device/numa_node ]; then
+        numa_node=$(cat /sys/class/net/${netdev_lookup}/device/numa_node)
+        if [ "${numa_node}" == "-1" ]; then
+            # VM case, no NUMA locality
+            numa_node=0
+        fi
+    else
+        numa_node=0
+    fi
+    numa_node_cpus=$(cat /sys/devices/system/node/node${numa_node}/cpulist)
+    numa_node_cpus=$(echo ${numa_node_cpus} | perl -pe 's/(\d+)-(\d+)/join(",",$1..$2)/eg')
+}
+
+# Resolves the IPv4 address bound to a netdev. Used by the server to
+# publish its control-channel address via msgs/tx/svc. Mirrors
+# bench-iperf's ifname-to-IP resolution.
+# Sets: $ip
+function resolve_ip_for_netdev() {
+    local netdev_lookup="$1"
+    ip=""
+    ip -j a >ip.json
+    local ifname_idx=$(jq 'to_entries | .[] | if (.value.ifname == "'${netdev_lookup}'") then .key else null end' ip.json | grep -v null)
+    if [ -z "${ifname_idx}" ]; then
+        local interfaces=$(jq -r '. | to_entries | .[] | .value.ifname' ip.json)
+        exit_error "could not find netdev ${netdev_lookup}, interfaces are: ${interfaces}"
+    fi
+    local addr_idx=$(jq '.['${ifname_idx}'].addr_info | to_entries | .[] | if (.value.family == "inet") then .key else null end' ip.json | grep -v null | head -1)
+    if [ -z "${addr_idx}" ]; then
+        exit_error "an IPv4 address could not be found for ${netdev_lookup}"
+    fi
+    ip=$(jq -r '.['${ifname_idx}'].addr_info['${addr_idx}'].local' ip.json)
+    if [ -z "${ip}" ]; then
+        exit_error "IP was not found from ${netdev_lookup}"
+    fi
+}
+
+# Resolves --gid-index into either an explicit numeric index, an
+# auto-detected RoCEv2 GID index, or empty (meaning: don't pass -x at
+# all, e.g. a pure InfiniBand fabric where GID selection isn't
+# relevant).
+#
+# A port typically exposes both an IPv6 link-local "RoCE v2" GID and,
+# once an IPv4 address is configured, a second IPv4-mapped "RoCE v2"
+# GID (e.g. "0000:0000:0000:0000:0000:ffff:c0a8:c701" for 192.168.199.1).
+# Verified against real ConnectX-6 Lx hardware: with an IPv4 address
+# configured, perftest's own default device selection (no -x given)
+# picks the IPv4-mapped entry, not the first "RoCE v2" match -- so
+# auto-detection here must prefer an IPv4-mapped GID over an IPv6 one,
+# falling back to IPv6-only if no IPv4 mapping exists.
+# Uses: $gid_index, $device, $ib_port
+# Sets: $gid_index (may become empty)
+function resolve_gid_index() {
+    case "${gid_index}" in
+        none)
+            gid_index=""
+            ;;
+        auto)
+            local types_dir="/sys/class/infiniband/${device}/ports/${ib_port}/gid_attrs/types"
+            local gids_dir="/sys/class/infiniband/${device}/ports/${ib_port}/gids"
+            local fallback=""
+            gid_index=""
+            if [ -d "${types_dir}" ]; then
+                for type_file in "${types_dir}"/*; do
+                    if [ -f "${type_file}" ] && grep -q "RoCE v2" "${type_file}" 2>/dev/null; then
+                        local idx=$(basename "${type_file}")
+                        local gid_val=$(cat "${gids_dir}/${idx}" 2>/dev/null)
+                        if [[ "${gid_val}" == 0000:0000:0000:0000:0000:ffff:* ]]; then
+                            gid_index="${idx}"
+                            break
+                        elif [ -z "${fallback}" ]; then
+                            fallback="${idx}"
+                        fi
+                    fi
+                done
+                if [ -z "${gid_index}" ]; then
+                    gid_index="${fallback}"
+                fi
+            fi
+            ;;
+        *)
+            # explicit numeric index, use as-is
+            ;;
+    esac
+}
+
+# Resolves --cpu-pin/--cpu-pin-list into an external command prefix to
+# wrap the perftest invocation in. perftest has NO native NUMA/core-
+# affinity flags -- verified directly against the installed binary's
+# own --help output (perftest 25.10.0.0.128; earlier docs/design notes
+# assumed --numa_node/--pin_cores existed without checking, and were
+# wrong). So this wraps the command in `taskset --cpu-list`, the same
+# mechanism bench-iperf already uses for the same reason (iperf3 also
+# has no native affinity flags) -- confining the whole process to a
+# CPU range and letting the kernel scheduler place it, not per-thread
+# pinning.
+# Uses: $cpu_pin, $cpu_pin_list, $numa_node_cpus
+# Sets: $cpu_pin_cmd
+function resolve_cpu_pin_opts() {
+    cpu_pin_cmd=""
+    case "${cpu_pin}" in
+        numa)
+            cpu_pin_cmd="taskset --cpu-list ${numa_node_cpus}"
+            ;;
+        cpu)
+            if [ "${cpu_pin_list}" == "none" ] || [ -z "${cpu_pin_list}" ]; then
+                exit_error "--cpu-pin=cpu requires --cpu-pin-list to be set"
+            fi
+            cpu_pin_cmd="taskset --cpu-list ${cpu_pin_list}"
+            ;;
+        none|"")
+            cpu_pin_cmd=""
+            ;;
+        *)
+            exit_error "unsupported cpu-pin value '${cpu_pin}'"
+            ;;
+    esac
+}

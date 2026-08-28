@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+# -*- mode: python; indent-tabs-mode: nil; python-indent-level: 4 -*-
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=python
+
+"""Prefixes each line of stdin with its own wall-clock arrival time.
+
+perftest's --run_infinitely periodic reports carry no timestamp of
+their own, and its internal print-thread sleep() can drift under CPU
+contention from the main polling loop (confirmed live: only 23 of an
+expected ~30 reports arrived in a clean 30-second window at
+report-interval=1) -- so report-interval can't be trusted to derive
+accurate per-sample timestamps after the fact by assuming fixed
+spacing. Timestamping each line as it actually arrives removes that
+assumption: sample spacing becomes real, not synthesized.
+"""
+
+import sys
+import time
+
+for line in sys.stdin:
+    sys.stdout.write("%.6f %s" % (time.time(), line))
+    sys.stdout.flush()

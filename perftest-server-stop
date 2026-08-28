@@ -1,0 +1,30 @@
+#!/bin/bash
+# -*- mode: sh; indent-tabs-mode: nil; sh-basic-offset: 4 -*-
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=bash
+
+exec >perftest-server-stop-stderrout.txt
+exec 2>&1
+
+. /usr/bin/perftest-base || (echo "/usr/bin/perftest-base not found"; exit 1)
+
+dump_runtime
+validate_label
+
+if [ ! -e perftest-server.pid ]; then
+    exit_error "perftest-server.pid not found"
+fi
+pid=$(cat perftest-server.pid)
+
+# perftest's server runs forever under --run_infinitely (mirrors the
+# client) -- standard background-daemon shutdown, not a
+# wait-for-natural-exit check.
+if [ -e /proc/${pid} ]; then
+    kill ${pid}
+    sleep 2
+    if [ -e /proc/${pid} ]; then
+        kill -9 ${pid}
+    fi
+fi
+
+date +%s.%N > perftest-stop.txt
+exit 0
